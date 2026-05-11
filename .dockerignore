@@ -1,0 +1,7 @@
+target
+storage
+.git
+.gitignore
+Dockerfile
+compose.yaml
+README.md

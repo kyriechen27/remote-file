@@ -1,0 +1,14 @@
+services:
+  remote-file:
+    image: coketeatt/remote-file:latest
+    container_name: remote-file
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    environment:
+      REMOTE_FILE_BIND: 0.0.0.0:8080
+      REMOTE_FILE_ROOT: /data/files
+      REMOTE_FILE_DATA: /data/meta
+    volumes:
+      - ./storage/files:/data/files
+      - ./storage/meta:/data/meta
