@@ -44,9 +44,10 @@ admin / admin
 REMOTE_FILE_BIND=127.0.0.1:8080
 REMOTE_FILE_ROOT=storage/files
 REMOTE_FILE_DATA=storage/meta
+REMOTE_FILE_UPLOAD_LIMIT_BYTES=10737418240
 ```
 
-`REMOTE_FILE_ROOT` 是实际文件根目录，`REMOTE_FILE_DATA` 保存用户、会话和公开文件记录。
+`REMOTE_FILE_ROOT` 是实际文件根目录，`REMOTE_FILE_DATA` 保存用户、会话和公开文件记录。`REMOTE_FILE_UPLOAD_LIMIT_BYTES` 控制单次请求上传大小上限，默认 10GB。
 
 ## Docker Compose
 

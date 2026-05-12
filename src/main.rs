@@ -8,7 +8,7 @@ use std::{
 use anyhow::{Context, Result};
 use axum::{
     Json, Router,
-    extract::{DefaultBodyLimit, Multipart, Path as AxumPath, State},
+    extract::{DefaultBodyLimit, Multipart, Path as AxumPath, State, multipart::Field},
     http::{
         StatusCode,
         header::{
@@ -21,17 +21,18 @@ use axum::{
 };
 use base64::{
     Engine,
-    engine::general_purpose::{STANDARD, STANDARD_NO_PAD},
+    engine::general_purpose::{STANDARD, STANDARD_NO_PAD, URL_SAFE_NO_PAD},
 };
 use chrono::{DateTime, Utc};
 use rand::{RngCore, rngs::OsRng};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use tokio::{fs, sync::RwLock};
+use tokio::{fs, io::AsyncWriteExt, sync::RwLock};
 use tower_http::trace::TraceLayer;
 
 const DEFAULT_ADMIN: &str = "admin";
 const DEFAULT_PASSWORD: &str = "admin";
+const DEFAULT_UPLOAD_LIMIT_BYTES: usize = 10 * 1024 * 1024 * 1024;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -49,6 +50,7 @@ async fn main() -> Result<()> {
         audit_logs: Arc::new(RwLock::new(audit_logs)),
     };
 
+    let upload_limit_bytes = state.config.upload_limit_bytes;
     let app = Router::new()
         .route("/", get(index))
         .route("/app.js", get(app_js))
@@ -79,7 +81,7 @@ async fn main() -> Result<()> {
         .route("/api/grants/*path", put(api_grant_file))
         .route("/public/*path", get(public_download))
         .route("/p/*path", get(public_download))
-        .layer(DefaultBodyLimit::max(1024 * 1024 * 1024))
+        .layer(DefaultBodyLimit::max(upload_limit_bytes))
         .layer(TraceLayer::new_for_http())
         .with_state(state.clone());
 
@@ -97,6 +99,7 @@ struct Config {
     bind: SocketAddr,
     files_dir: PathBuf,
     data_dir: PathBuf,
+    upload_limit_bytes: usize,
 }
 
 impl Config {
@@ -111,10 +114,16 @@ impl Config {
         let data_dir = std::env::var("REMOTE_FILE_DATA")
             .map(PathBuf::from)
             .unwrap_or_else(|_| PathBuf::from("storage/meta"));
+        let upload_limit_bytes = std::env::var("REMOTE_FILE_UPLOAD_LIMIT_BYTES")
+            .ok()
+            .map(|value| parse_upload_limit(&value))
+            .transpose()?
+            .unwrap_or(DEFAULT_UPLOAD_LIMIT_BYTES);
         Ok(Self {
             bind,
             files_dir,
             data_dir,
+            upload_limit_bytes,
         })
     }
 }
@@ -511,7 +520,7 @@ async fn api_files(
     headers: HeaderMap,
     query: axum::extract::Query<HashMap<String, String>>,
 ) -> Response {
-    let Some(user) = current_user(&state, &headers).await else {
+    let Some(user) = current_user_or_basic(&state, &headers).await else {
         return error(StatusCode::UNAUTHORIZED, "请先登录");
     };
     let path = normalize_path(query.get("path").map(String::as_str).unwrap_or("/"));
@@ -715,7 +724,7 @@ async fn upload_to_path(
     conflict: UploadConflict,
     multipart: &mut Multipart,
 ) -> Response {
-    let Some(user) = current_user(&state, &headers).await else {
+    let Some(user) = current_user_or_basic(&state, &headers).await else {
         return error(StatusCode::UNAUTHORIZED, "请先登录");
     };
     if !user.permissions.can_upload {
@@ -753,18 +762,20 @@ async fn upload_to_path(
     }
 
     let mut uploaded = 0_u64;
-    while let Ok(Some(field)) = multipart.next_field().await {
+    while let Some(field) = match multipart.next_field().await {
+        Ok(field) => field,
+        Err(err) => {
+            return error(StatusCode::BAD_REQUEST, &format!("解析上传文件失败：{err}"));
+        }
+    } {
         let Some(file_name) = field.file_name().map(clean_file_name) else {
             continue;
-        };
-        let Ok(bytes) = field.bytes().await else {
-            return error(StatusCode::BAD_REQUEST, "读取上传文件失败");
         };
         let target = match upload_target_path(&full_dir, &file_name, conflict).await {
             Ok(path) => path,
             Err(response) => return response,
         };
-        if let Err(err) = fs::write(target, bytes).await {
+        if let Err(err) = write_upload_field(field, &target).await {
             return error(StatusCode::INTERNAL_SERVER_ERROR, &err.to_string());
         }
         uploaded += 1;
@@ -780,6 +791,23 @@ async fn upload_to_path(
     )
     .await;
     StatusCode::NO_CONTENT.into_response()
+}
+
+async fn write_upload_field(mut field: Field<'_>, target: &Path) -> Result<()> {
+    let temp_path = upload_temp_path(target);
+    let mut file = fs::File::create(&temp_path)
+        .await
+        .with_context(|| format!("创建临时上传文件失败：{}", temp_path.display()))?;
+    while let Some(chunk) = field.chunk().await.context("读取上传文件分片失败")? {
+        file.write_all(&chunk).await.context("写入上传文件失败")?;
+    }
+    file.flush().await.context("刷新上传文件失败")?;
+    drop(file);
+    if let Err(err) = fs::rename(&temp_path, target).await {
+        let _ = fs::remove_file(&temp_path).await;
+        return Err(err).with_context(|| format!("保存上传文件失败：{}", target.display()));
+    }
+    Ok(())
 }
 
 async fn api_mkdir(
@@ -1171,10 +1199,10 @@ async fn api_publish(
         Ok(path) => path,
         Err(err) => return error(StatusCode::BAD_REQUEST, &err.to_string()),
     };
-    if let Some(parent) = public_full_path.parent() {
-        if let Err(err) = fs::create_dir_all(parent).await {
-            return error(StatusCode::INTERNAL_SERVER_ERROR, &err.to_string());
-        }
+    if let Some(parent) = public_full_path.parent()
+        && let Err(err) = fs::create_dir_all(parent).await
+    {
+        return error(StatusCode::INTERNAL_SERVER_ERROR, &err.to_string());
     }
     if let Err(err) = fs::copy(&source_path, &public_full_path).await {
         return error(StatusCode::INTERNAL_SERVER_ERROR, &err.to_string());
@@ -1242,10 +1270,10 @@ async fn api_unpublish(
         return error(StatusCode::INTERNAL_SERVER_ERROR, &err.to_string());
     }
     drop(store);
-    if let Ok(full_path) = safe_join(&state.config.files_dir, &public_path) {
-        if public_path != path || is_public_path(&public_path) {
-            let _ = fs::remove_file(full_path).await;
-        }
+    if let Ok(full_path) = safe_join(&state.config.files_dir, &public_path)
+        && (public_path != path || is_public_path(&public_path))
+    {
+        let _ = fs::remove_file(full_path).await;
     }
     record_audit(
         &state,
@@ -1633,6 +1661,16 @@ fn clean_file_name(file_name: &str) -> String {
         .to_string()
 }
 
+fn upload_temp_path(target: &Path) -> PathBuf {
+    let token = random_token();
+    let safe_token = URL_SAFE_NO_PAD.encode(token.as_bytes());
+    let file_name = target
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("upload.bin");
+    target.with_file_name(format!(".{file_name}.{safe_token}.uploading"))
+}
+
 async fn upload_target_path(
     dir: &Path,
     file_name: &str,
@@ -1782,6 +1820,18 @@ fn random_token() -> String {
     STANDARD_NO_PAD.encode(bytes)
 }
 
+fn parse_upload_limit(value: &str) -> Result<usize> {
+    let bytes = value
+        .trim()
+        .parse::<usize>()
+        .with_context(|| "REMOTE_FILE_UPLOAD_LIMIT_BYTES must be a positive integer")?;
+    anyhow::ensure!(
+        bytes > 0,
+        "REMOTE_FILE_UPLOAD_LIMIT_BYTES must be greater than 0"
+    );
+    Ok(bytes)
+}
+
 fn error(status: StatusCode, message: &str) -> Response {
     (
         status,
@@ -1917,6 +1967,30 @@ const INDEX_HTML: &str = r#"<!doctype html>
     .badge { display: inline-flex; align-items: center; min-height: 24px; padding: 0 8px; border-radius: 999px; font-size: 12px; border: 1px solid var(--line); color: var(--muted); }
     .badge.public { color: var(--ok); border-color: #bfe0cd; background: #eef8f1; }
     .actions { display: flex; gap: 8px; justify-content: flex-end; flex-wrap: wrap; }
+    .upload-progress {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) auto;
+      gap: 10px 14px;
+      align-items: center;
+      margin: -8px 0 14px;
+      padding: 12px 14px;
+      color: var(--muted);
+      font-size: 13px;
+    }
+    .upload-progress strong { color: var(--ink); font-weight: 600; }
+    .progress-track {
+      grid-column: 1 / -1;
+      height: 8px;
+      overflow: hidden;
+      border-radius: 999px;
+      background: #e2eaed;
+    }
+    .progress-bar {
+      width: 0%;
+      height: 100%;
+      background: var(--accent);
+      transition: width 120ms ease-out;
+    }
     .login {
       min-height: 100vh;
       display: grid;
@@ -1995,6 +2069,11 @@ const INDEX_HTML: &str = r#"<!doctype html>
             <button id="refresh-btn">刷新</button>
           </div>
         </div>
+        <div id="upload-progress" class="panel upload-progress hidden">
+          <strong id="upload-progress-title">正在上传</strong>
+          <span id="upload-progress-detail">0%</span>
+          <div class="progress-track"><div id="upload-progress-bar" class="progress-bar"></div></div>
+        </div>
         <div class="panel table" id="files-table"></div>
       </section>
       <section id="admin-view" class="hidden">
@@ -2032,6 +2111,7 @@ const APP_JS: &str = r#"const state = {
   path: new URLSearchParams(location.search).get('path') || '/',
   view: 'files',
   entries: [],
+  upload: null,
 };
 
 const $ = (id) => document.getElementById(id);
@@ -2347,8 +2427,9 @@ async function deletePath(path) {
 
 async function uploadFiles(files) {
   if (!files.length) return;
+  const fileList = [...files];
   const existing = new Set((state.entries || []).map((entry) => entry.name));
-  const hasConflict = [...files].some((file) => existing.has(file.name));
+  const hasConflict = fileList.some((file) => existing.has(file.name));
   let conflict = 'error';
   if (hasConflict) {
     conflict = confirm('检测到同名文件。确定覆盖已有文件？取消则自动改名上传。')
@@ -2356,10 +2437,102 @@ async function uploadFiles(files) {
       : 'rename';
   }
   const data = new FormData();
-  [...files].forEach((file) => data.append('file', file));
-  await api(`/api/files${encodeApiPath(state.path)}?conflict=${conflict}`, { method: 'PUT', body: data });
-  toast('上传完成');
-  await loadFiles();
+  fileList.forEach((file) => data.append('file', file));
+  showUploadProgress(fileList);
+  $('upload-btn').disabled = true;
+  try {
+    await uploadWithProgress(
+      `/api/files${encodeApiPath(state.path)}?conflict=${conflict}`,
+      data,
+      (event) => updateUploadProgress(event, fileList)
+    );
+    updateUploadProgress({ lengthComputable: true, loaded: totalUploadSize(fileList), total: totalUploadSize(fileList) }, fileList);
+    toast('上传完成');
+    await loadFiles();
+  } finally {
+    $('upload-btn').disabled = false;
+    $('upload-input').value = '';
+    setTimeout(hideUploadProgress, 500);
+  }
+}
+
+function uploadWithProgress(url, data, onProgress) {
+  return new Promise((resolve, reject) => {
+    const request = new XMLHttpRequest();
+    request.open('PUT', url);
+    request.withCredentials = true;
+    request.upload.onprogress = onProgress;
+    request.onload = () => {
+      if (request.status >= 200 && request.status < 300) {
+        resolve();
+        return;
+      }
+      reject(new Error(uploadErrorMessage(request)));
+    };
+    request.onerror = () => reject(new Error('上传失败，请检查网络后重试'));
+    request.onabort = () => reject(new Error('上传已取消'));
+    request.send(data);
+  });
+}
+
+function uploadErrorMessage(request) {
+  const fallback = `上传失败（HTTP ${request.status || '网络错误'}）`;
+  try {
+    return JSON.parse(request.responseText).error || fallback;
+  } catch {
+    return request.responseText || fallback;
+  }
+}
+
+function showUploadProgress(files) {
+  state.upload = {
+    startedAt: performance.now(),
+    lastAt: performance.now(),
+    lastLoaded: 0,
+    speed: 0,
+  };
+  $('upload-progress').classList.remove('hidden');
+  $('upload-progress-title').textContent = `正在上传 ${files.length} 个文件`;
+  $('upload-progress-detail').textContent = '准备上传';
+  $('upload-progress-bar').style.width = '0%';
+}
+
+function updateUploadProgress(event, files) {
+  const total = event.lengthComputable ? event.total : totalUploadSize(files);
+  const loaded = event.lengthComputable ? event.loaded : 0;
+  if (!total) {
+    $('upload-progress-detail').textContent = `正在上传 · ${formatUploadSpeed(loaded)}`;
+    return;
+  }
+  const percent = Math.min(100, Math.round((loaded / total) * 100));
+  $('upload-progress-detail').textContent = `${percent}% · ${formatSize(loaded)} / ${formatSize(total)} · ${formatUploadSpeed(loaded)}`;
+  $('upload-progress-bar').style.width = `${percent}%`;
+}
+
+function hideUploadProgress() {
+  $('upload-progress').classList.add('hidden');
+  state.upload = null;
+}
+
+function totalUploadSize(files) {
+  return files.reduce((total, file) => total + file.size, 0);
+}
+
+function formatUploadSpeed(loaded) {
+  const now = performance.now();
+  const upload = state.upload || { startedAt: now, lastAt: now, lastLoaded: loaded, speed: 0 };
+  const elapsedSinceLast = Math.max(0, now - upload.lastAt);
+  if (elapsedSinceLast >= 250 && loaded >= upload.lastLoaded) {
+    const instantSpeed = ((loaded - upload.lastLoaded) * 1000) / elapsedSinceLast;
+    upload.speed = upload.speed ? upload.speed * 0.65 + instantSpeed * 0.35 : instantSpeed;
+    upload.lastAt = now;
+    upload.lastLoaded = loaded;
+    state.upload = upload;
+  }
+  const elapsed = Math.max(1, now - upload.startedAt);
+  const averageSpeed = (loaded * 1000) / elapsed;
+  const speed = upload.speed || averageSpeed;
+  return `${formatSize(speed)}/s`;
 }
 
 async function createFolder() {
@@ -2538,3 +2711,15 @@ $('user-role').addEventListener('change', updateDefaultUserRoot);
 
 boot().catch((err) => toast(err.message));
 "#;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_upload_limit_rejects_zero_and_invalid_values() {
+        assert_eq!(parse_upload_limit("1024").unwrap(), 1024);
+        assert!(parse_upload_limit("0").is_err());
+        assert!(parse_upload_limit("not-a-number").is_err());
+    }
+}

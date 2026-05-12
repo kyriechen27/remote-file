@@ -11,6 +11,7 @@ services:
       REMOTE_FILE_BIND: 0.0.0.0:8080
       REMOTE_FILE_ROOT: /data/files
       REMOTE_FILE_DATA: /data/meta
+      REMOTE_FILE_UPLOAD_LIMIT_BYTES: 10737418240
     volumes:
       - ./storage/files:/data/files
       - ./storage/meta:/data/meta
