@@ -10,7 +10,7 @@
 - 用户目录授权，可限制用户只能访问指定目录
 - 新建普通用户默认目录为 `/user/用户名`，只有管理员默认拥有根目录 `/`
 - 普通用户登录后默认进入自己的 `/user/用户名` 目录
-- 系统启动时自动创建 `/public`，公开文件会复制到 `/public/用户名` 后再生成免登录直链
+- 文件公开后会生成免登录直链，不会复制原文件占用额外存储
 - 用户能力开关：上传、删除、公开文件
 - 文件可复制登录后下载链接，登录且有权限的用户可访问
 - 文件可授权给指定用户，被授权用户登录后可下载该文件
@@ -121,15 +121,86 @@ docker compose pull
 docker compose up -d
 ```
 
-## 公开直链
+## Cloudflare Pages + R2 部署
 
-用户可以把自己有权限访问的文件设为公开。系统会先把文件复制到 `/public/用户名`，再为这个公开副本生成链接，形如：
+本项目现在也支持像 `ljxi/Cloudflare-R2-oss` 一样直接部署到 Cloudflare Pages。Cloudflare 版本使用：
+
+- `public/`：静态前端页面
+- `functions/[[path]].js`：Pages Functions API
+- R2 绑定 `BUCKET`：保存上传文件、用户状态、会话、公开链接和审计日志
+
+Cloudflare 版本和 Rust/Docker 版本共用前端交互和 API 路径，但存储后端不同：Cloudflare 版本没有本地文件系统，全部数据都会写入 R2。
+
+### 通过 Cloudflare 控制台部署
+
+1. Fork 或推送本仓库到 GitHub。
+2. 在 Cloudflare R2 新建存储桶，例如 `remote-file`。
+3. 在 Cloudflare Pages 新建项目，连接该 Git 仓库。
+4. 构建设置保持简单：
 
 ```text
-http://127.0.0.1:8080/public/用户名/file.ext
+Build command: 留空
+Build output directory: public
 ```
 
-该链接不需要登录即可访问。取消公开后，公开副本会被移除，原文件仍保留在原目录。
+5. 部署后进入 Pages 项目设置，打开 `Functions` -> `R2 bucket bindings`，添加绑定：
+
+```text
+Variable name: BUCKET
+R2 bucket: remote-file
+```
+
+6. 重新部署 Pages 项目。
+
+首次访问后会自动初始化默认管理员：
+
+```text
+admin / admin
+```
+
+首次登录后请立即在后台修改管理员密码。
+
+### 本地调试 Cloudflare 版本
+
+启动本地 R2 预览环境：
+
+```bash
+npm run dev:cloudflare
+```
+
+默认会通过 Wrangler Pages Dev 启动本地 Cloudflare Pages Functions 环境，并把 R2 绑定命名为 `BUCKET`。
+
+### 命令行部署
+
+确认已经登录 Wrangler：
+
+```bash
+npx wrangler login
+```
+
+创建 R2 存储桶：
+
+```bash
+npx wrangler r2 bucket create remote-file
+```
+
+部署 Pages：
+
+```bash
+npm run deploy:cloudflare
+```
+
+如果你的 R2 存储桶不是 `remote-file`，请同步修改 [wrangler.toml](./wrangler.toml) 里的 `bucket_name`。
+
+## 公开直链
+
+用户可以把自己有权限访问的文件设为公开。系统会为原文件生成免登录直链，形如：
+
+```text
+http://127.0.0.1:8080/public/path/to/file.ext
+```
+
+该链接不需要登录即可访问。取消公开后，直链失效，原文件仍保留在原目录。
 
 ## 登录链接和文件授权
 

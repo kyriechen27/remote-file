@@ -1,0 +1,10 @@
+{
+  "name": "remote-file",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Remote File with Cloudflare Pages Functions and R2 deployment support.",
+  "scripts": {
+    "dev:cloudflare": "npx wrangler pages dev public --compatibility-date=2024-11-18 --r2=BUCKET",
+    "deploy:cloudflare": "npx wrangler pages deploy public --project-name=remote-file"
+  }
+}

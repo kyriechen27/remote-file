@@ -1,0 +1,243 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Remote File</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --bg: #f7f5ef;
+      --panel: #ffffff;
+      --ink: #1f2933;
+      --muted: #697386;
+      --line: #d8dee8;
+      --accent: #176b87;
+      --accent-strong: #0f4c5c;
+      --ok: #2f7d4f;
+      --warn: #b45309;
+      --danger: #b42318;
+      --shadow: 0 12px 28px rgba(32, 45, 61, 0.10);
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      min-height: 100vh;
+      color: var(--ink);
+      background:
+        linear-gradient(180deg, rgba(255,255,255,0.72), rgba(255,255,255,0.32)),
+        var(--bg);
+      font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+    button, input, select { font: inherit; }
+    button {
+      border: 1px solid var(--line);
+      background: #fff;
+      color: var(--ink);
+      border-radius: 7px;
+      min-height: 36px;
+      padding: 0 12px;
+      cursor: pointer;
+    }
+    button:hover { border-color: var(--accent); }
+    button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+    button.danger { color: var(--danger); border-color: #f3b8b2; }
+    button.icon { width: 36px; padding: 0; display: inline-grid; place-items: center; }
+    input, select {
+      width: 100%;
+      min-height: 38px;
+      border: 1px solid var(--line);
+      border-radius: 7px;
+      padding: 0 10px;
+      background: #fff;
+      color: var(--ink);
+    }
+    .hidden { display: none !important; }
+    .app-shell { min-height: 100vh; display: grid; grid-template-columns: 260px 1fr; }
+    .sidebar {
+      border-right: 1px solid var(--line);
+      background: rgba(255,255,255,0.72);
+      padding: 22px 18px;
+      display: flex;
+      flex-direction: column;
+      gap: 18px;
+    }
+    .brand { display: flex; align-items: center; gap: 12px; }
+    .brand-mark {
+      width: 40px; height: 40px; border-radius: 8px;
+      background: conic-gradient(from 210deg, #176b87, #2f7d4f, #d99a2b, #176b87);
+      box-shadow: var(--shadow);
+    }
+    .brand strong { display: block; font-size: 17px; }
+    .brand span { color: var(--muted); font-size: 12px; }
+    .nav { display: grid; gap: 8px; }
+    .nav button { text-align: left; border-color: transparent; background: transparent; }
+    .nav button.active { background: #eaf2f4; color: var(--accent-strong); border-color: #c7dce2; }
+    .account { margin-top: auto; display: grid; gap: 8px; color: var(--muted); font-size: 13px; }
+    .main { padding: 22px clamp(18px, 4vw, 42px); }
+    .topbar { display: flex; align-items: center; justify-content: space-between; gap: 16px; margin-bottom: 22px; }
+    .crumbs { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; color: var(--muted); }
+    .crumbs button { min-height: 30px; padding: 0 9px; }
+    .toolbar { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+    .panel {
+      background: rgba(255,255,255,0.88);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      box-shadow: var(--shadow);
+    }
+    .table { overflow: hidden; }
+    .row {
+      display: grid;
+      grid-template-columns: minmax(180px, 1fr) 110px 90px 190px 210px;
+      gap: 14px;
+      align-items: center;
+      min-height: 58px;
+      padding: 0 16px;
+      border-bottom: 1px solid var(--line);
+    }
+    .row.header { min-height: 42px; color: var(--muted); font-size: 12px; text-transform: uppercase; letter-spacing: 0; background: #fbfcfd; }
+    .row.audit { grid-template-columns: 180px 120px 120px minmax(180px, 1fr) 220px; }
+    .row:last-child { border-bottom: 0; }
+    .file-name { display: flex; align-items: center; gap: 10px; min-width: 0; }
+    .file-name button { border: 0; background: transparent; padding: 0; min-height: auto; text-align: left; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .badge { display: inline-flex; align-items: center; min-height: 24px; padding: 0 8px; border-radius: 999px; font-size: 12px; border: 1px solid var(--line); color: var(--muted); }
+    .badge.public { color: var(--ok); border-color: #bfe0cd; background: #eef8f1; }
+    .actions { display: flex; gap: 8px; justify-content: flex-end; flex-wrap: wrap; }
+    .upload-progress {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) auto;
+      gap: 10px 14px;
+      align-items: center;
+      margin: -8px 0 14px;
+      padding: 12px 14px;
+      color: var(--muted);
+      font-size: 13px;
+    }
+    .upload-progress strong { color: var(--ink); font-weight: 600; }
+    .progress-track {
+      grid-column: 1 / -1;
+      height: 8px;
+      overflow: hidden;
+      border-radius: 999px;
+      background: #e2eaed;
+    }
+    .progress-bar {
+      width: 0%;
+      height: 100%;
+      background: var(--accent);
+      transition: width 120ms ease-out;
+    }
+    .login {
+      min-height: 100vh;
+      display: grid;
+      place-items: center;
+      padding: 24px;
+    }
+    .login form {
+      width: min(420px, 100%);
+      display: grid;
+      gap: 14px;
+      padding: 28px;
+    }
+    .login h1 { margin: 0; font-size: 28px; }
+    .login p { margin: 0 0 8px; color: var(--muted); }
+    .admin-grid { display: grid; grid-template-columns: minmax(260px, 380px) 1fr; gap: 18px; align-items: start; }
+    .form { display: grid; gap: 12px; padding: 16px; }
+    .form label { display: grid; gap: 6px; color: var(--muted); font-size: 13px; }
+    .checks { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; }
+    .checks label { display: flex; align-items: center; gap: 8px; color: var(--ink); }
+    .checks input { width: auto; min-height: auto; }
+    .empty { padding: 42px 16px; text-align: center; color: var(--muted); }
+    .toast {
+      position: fixed; right: 18px; bottom: 18px; min-width: 240px;
+      padding: 12px 14px; background: var(--ink); color: #fff; border-radius: 8px;
+      box-shadow: var(--shadow);
+    }
+    @media (max-width: 860px) {
+      .app-shell { grid-template-columns: 1fr; }
+      .sidebar { position: sticky; top: 0; z-index: 2; flex-direction: row; align-items: center; }
+      .nav { display: flex; }
+      .account { margin-top: 0; margin-left: auto; }
+      .row { grid-template-columns: 1fr; gap: 6px; padding: 12px; }
+      .row.header { display: none; }
+      .actions { justify-content: flex-start; }
+      .admin-grid { grid-template-columns: 1fr; }
+    }
+  </style>
+</head>
+<body>
+  <div id="login" class="login hidden">
+    <form class="panel" id="login-form">
+      <div class="brand">
+        <div class="brand-mark"></div>
+        <div><strong>Remote File</strong><span>权限化文件系统</span></div>
+      </div>
+      <h1>登录</h1>
+      <p id="setup-hint" class="hidden">默认管理员账号 admin / admin，首次部署后请立即修改密码。</p>
+      <input id="login-user" autocomplete="username" placeholder="用户名" />
+      <input id="login-pass" autocomplete="current-password" placeholder="密码" type="password" />
+      <button class="primary" type="submit">登录</button>
+    </form>
+  </div>
+  <div id="app" class="app-shell hidden">
+    <aside class="sidebar">
+      <div class="brand">
+        <div class="brand-mark"></div>
+        <div><strong>Remote File</strong><span id="role-label">文件系统</span></div>
+      </div>
+      <nav class="nav">
+        <button id="nav-files" class="active">文件</button>
+        <button id="nav-admin">后台</button>
+      </nav>
+      <div class="account">
+        <span id="account-name"></span>
+        <button id="logout">退出登录</button>
+      </div>
+    </aside>
+    <main class="main">
+      <section id="files-view">
+        <div class="topbar">
+          <div class="crumbs" id="crumbs"></div>
+          <div class="toolbar">
+            <input id="upload-input" type="file" multiple hidden />
+            <button id="upload-btn" class="primary">上传</button>
+            <button id="mkdir-btn">新建文件夹</button>
+            <button id="refresh-btn">刷新</button>
+          </div>
+        </div>
+        <div id="upload-progress" class="panel upload-progress hidden">
+          <strong id="upload-progress-title">正在上传</strong>
+          <span id="upload-progress-detail">0%</span>
+          <div class="progress-track"><div id="upload-progress-bar" class="progress-bar"></div></div>
+        </div>
+        <div class="panel table" id="files-table"></div>
+      </section>
+      <section id="admin-view" class="hidden">
+        <div class="topbar">
+          <div><h2 style="margin:0">管理员后台</h2><p style="margin:4px 0 0;color:var(--muted)">管理用户、目录授权和公开直链能力。</p></div>
+        </div>
+        <div class="admin-grid">
+          <form class="panel form" id="user-form">
+            <input id="edit-username" type="hidden" />
+            <label>用户名<input id="user-username" required /></label>
+            <label>密码<input id="user-password" type="password" placeholder="编辑用户时留空则不修改" /></label>
+            <label>角色<select id="user-role"><option value="user">普通用户</option><option value="admin">管理员</option></select></label>
+            <label>可访问目录<input id="user-roots" placeholder="/user/alice, /team" /></label>
+            <div class="checks">
+              <label><input id="perm-upload" type="checkbox" checked />上传</label>
+              <label><input id="perm-delete" type="checkbox" />删除</label>
+              <label><input id="perm-publish" type="checkbox" />公开</label>
+            </div>
+            <button class="primary" type="submit">保存用户</button>
+            <button type="button" id="reset-user-form">新建用户</button>
+          </form>
+          <div class="panel table" id="users-table"></div>
+        </div>
+        <div class="panel table" id="audit-table" style="margin-top:18px"></div>
+      </section>
+    </main>
+  </div>
+  <div id="toast" class="toast hidden"></div>
+  <script src="/app.js"></script>
+</body>
+</html>

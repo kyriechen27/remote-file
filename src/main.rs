@@ -140,6 +140,8 @@ struct Store {
     users: HashMap<String, User>,
     sessions: HashMap<String, Session>,
     public_files: HashMap<String, PublicFile>,
+    // Legacy state from the old copy-based publish flow. New publishes store
+    // the source path directly in public_files and leave this map empty.
     #[serde(default)]
     public_copies: HashMap<String, String>,
     #[serde(default)]
@@ -552,12 +554,7 @@ async fn api_files(
             Ok(meta) => meta,
             Err(_) => continue,
         };
-        let public_path = store.public_copies.get(&entry_path).cloned().or_else(|| {
-            store
-                .public_files
-                .contains_key(&entry_path)
-                .then(|| entry_path.clone())
-        });
+        let public_path = public_path_for_source(&store, &entry_path);
         let public = public_path.is_some();
         let granted_users = store
             .file_grants
@@ -579,7 +576,7 @@ async fn api_files(
             download_url: format!("/api/files{}", encode_path(&entry_path)),
             download_count,
             public,
-            public_url: public_path.as_deref().map(public_url_for_path),
+            public_url: public_path.as_deref().map(public_url_for_source_path),
             granted_users,
         });
     }
@@ -652,7 +649,7 @@ async fn public_download(
 ) -> Response {
     let path = normalize_public_request_path(&path);
     let store = state.store.read().await;
-    if !store.public_files.contains_key(&path) {
+    let Some(source_path) = public_source_path(&store, &path) else {
         drop(store);
         record_audit(
             &state,
@@ -665,12 +662,12 @@ async fn public_download(
         )
         .await;
         return error(StatusCode::NOT_FOUND, "公开文件不存在");
-    }
+    };
     drop(store);
     let force_download = query
         .get("download")
         .is_some_and(|value| value == "1" || value == "true");
-    let response = serve_counted_public_file(&state, &path, force_download).await;
+    let response = serve_counted_public_file(&state, &source_path, &path, force_download).await;
     record_audit(
         &state,
         &headers,
@@ -801,7 +798,6 @@ async fn write_upload_field(mut field: Field<'_>, target: &Path) -> Result<()> {
     while let Some(chunk) = field.chunk().await.context("读取上传文件分片失败")? {
         file.write_all(&chunk).await.context("写入上传文件失败")?;
     }
-    file.flush().await.context("刷新上传文件失败")?;
     drop(file);
     if let Err(err) = fs::rename(&temp_path, target).await {
         let _ = fs::remove_file(&temp_path).await;
@@ -944,14 +940,12 @@ async fn api_delete(
         return error(StatusCode::INTERNAL_SERVER_ERROR, &err.to_string());
     }
     let mut store = state.store.write().await;
-    store.public_files.remove(&path);
-    if let Some(public_path) = store.public_copies.remove(&path) {
+    if let Some(public_path) = public_path_for_source(&store, &path) {
         store.public_files.remove(&public_path);
         store.download_counts.remove(&public_path);
-        if let Ok(full_path) = safe_join(&state.config.files_dir, &public_path) {
-            let _ = fs::remove_file(full_path).await;
-        }
     }
+    store.public_files.remove(&path);
+    store.public_copies.remove(&path);
     store.file_grants.remove(&path);
     store.download_counts.remove(&path);
     let _ = store.save().await;
@@ -1190,37 +1184,12 @@ async fn api_publish(
     if meta.is_dir() {
         return error(StatusCode::BAD_REQUEST, "暂不支持公开整个目录");
     }
-    let public_path =
-        match next_public_copy_path(&state.config.files_dir, &user.username, &path).await {
-            Ok(path) => path,
-            Err(err) => return error(StatusCode::INTERNAL_SERVER_ERROR, &err.to_string()),
-        };
-    let public_full_path = match safe_join(&state.config.files_dir, &public_path) {
-        Ok(path) => path,
-        Err(err) => return error(StatusCode::BAD_REQUEST, &err.to_string()),
-    };
-    if let Some(parent) = public_full_path.parent()
-        && let Err(err) = fs::create_dir_all(parent).await
-    {
-        return error(StatusCode::INTERNAL_SERVER_ERROR, &err.to_string());
-    }
-    if let Err(err) = fs::copy(&source_path, &public_full_path).await {
-        return error(StatusCode::INTERNAL_SERVER_ERROR, &err.to_string());
-    }
     let mut store = state.store.write().await;
-    if let Some(old_public_path) = store
-        .public_copies
-        .insert(path.clone(), public_path.clone())
-    {
-        store.public_files.remove(&old_public_path);
-        if let Ok(old_full_path) = safe_join(&state.config.files_dir, &old_public_path) {
-            let _ = fs::remove_file(old_full_path).await;
-        }
-    }
+    store.public_copies.remove(&path);
     store.public_files.insert(
-        public_path.clone(),
+        path.clone(),
         PublicFile {
-            path: public_path.clone(),
+            path: path.clone(),
             published_by: user.username.clone(),
             published_at: Utc::now(),
         },
@@ -1233,14 +1202,14 @@ async fn api_publish(
         &headers,
         Some(user.username),
         "publish",
-        Some(path),
+        Some(path.clone()),
         StatusCode::OK,
-        format!("公开副本 {public_path}"),
+        "公开文件链接",
     )
     .await;
     Json(serde_json::json!({
-        "public_path": public_path,
-        "public_url": public_url_for_path(&public_path)
+        "public_path": path,
+        "public_url": public_url_for_source_path(&path)
     }))
     .into_response()
 }
@@ -1255,25 +1224,12 @@ async fn api_unpublish(
     };
     let path = normalize_path(&path);
     let mut store = state.store.write().await;
-    let public_path = store
-        .public_copies
-        .remove(&path)
-        .unwrap_or_else(|| path.clone());
-    if public_path == path {
-        store
-            .public_copies
-            .retain(|_, public| public != &public_path);
-    }
-    store.public_files.remove(&public_path);
-    store.download_counts.remove(&public_path);
+    let public_path = path.clone();
+    store.public_copies.remove(&path);
+    store.public_files.remove(&path);
+    store.download_counts.remove(&path);
     if let Err(err) = store.save().await {
         return error(StatusCode::INTERNAL_SERVER_ERROR, &err.to_string());
-    }
-    drop(store);
-    if let Ok(full_path) = safe_join(&state.config.files_dir, &public_path)
-        && (public_path != path || is_public_path(&public_path))
-    {
-        let _ = fs::remove_file(full_path).await;
     }
     record_audit(
         &state,
@@ -1282,7 +1238,7 @@ async fn api_unpublish(
         "unpublish",
         Some(path),
         StatusCode::NO_CONTENT,
-        format!("移除公开副本 {public_path}"),
+        format!("取消公开链接 {public_path}"),
     )
     .await;
     Json(serde_json::json!({ "public_path": public_path })).into_response()
@@ -1462,25 +1418,22 @@ async fn serve_counted_file(state: &AppState, path: &str, force_download: bool) 
 
 async fn serve_counted_public_file(
     state: &AppState,
+    source_path: &str,
     public_path: &str,
     force_download: bool,
 ) -> Response {
-    let response = serve_file(&state.config.files_dir, public_path, force_download).await;
+    let response = serve_file(&state.config.files_dir, source_path, force_download).await;
     if response.status().is_success() {
-        let source_path = {
-            let store = state.store.read().await;
-            store
-                .public_copies
-                .iter()
-                .find_map(|(source, public)| (public == public_path).then(|| source.clone()))
-        };
         let mut store = state.store.write().await;
         *store
             .download_counts
             .entry(public_path.to_string())
             .or_insert(0) += 1;
-        if let Some(source_path) = source_path {
-            *store.download_counts.entry(source_path).or_insert(0) += 1;
+        if source_path != public_path {
+            *store
+                .download_counts
+                .entry(source_path.to_string())
+                .or_insert(0) += 1;
         }
         let _ = store.save().await;
     }
@@ -1563,6 +1516,24 @@ fn is_public_path(path: &str) -> bool {
     path == "/public" || path.starts_with("/public/")
 }
 
+fn public_path_for_source(store: &Store, source_path: &str) -> Option<String> {
+    store
+        .public_files
+        .contains_key(source_path)
+        .then(|| source_path.to_string())
+}
+
+fn public_source_path(store: &Store, public_path: &str) -> Option<String> {
+    let source_path = source_path_from_public_url(public_path);
+    if store.public_files.contains_key(&source_path) {
+        Some(source_path)
+    } else if store.public_files.contains_key(public_path) {
+        Some(public_path.to_string())
+    } else {
+        None
+    }
+}
+
 fn safe_join(root: &Path, path: &str) -> Result<PathBuf> {
     let path = normalize_path(path);
     let mut target = root.to_path_buf();
@@ -1619,38 +1590,16 @@ fn normalize_public_request_path(path: &str) -> String {
     }
 }
 
-fn public_url_for_path(path: &str) -> String {
+fn public_url_for_source_path(path: &str) -> String {
     format!("/public{}", encode_path(path).trim_start_matches("/public"))
 }
 
-async fn next_public_copy_path(root: &Path, username: &str, source_path: &str) -> Result<String> {
-    let file_name = Path::new(source_path)
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("file");
-    let stem = Path::new(file_name)
-        .file_stem()
-        .and_then(|name| name.to_str())
-        .unwrap_or("file");
-    let extension = Path::new(file_name)
-        .extension()
-        .and_then(|name| name.to_str());
-    let base_dir = format!("/public/{}", username);
-    for index in 0..1000 {
-        let candidate_name = if index == 0 {
-            file_name.to_string()
-        } else if let Some(extension) = extension {
-            format!("{stem}-{index}.{extension}")
-        } else {
-            format!("{stem}-{index}")
-        };
-        let candidate = join_virtual(&base_dir, &candidate_name);
-        let full_path = safe_join(root, &candidate)?;
-        if !fs::try_exists(full_path).await? {
-            return Ok(candidate);
-        }
+fn source_path_from_public_url(path: &str) -> String {
+    if is_public_path(path) {
+        normalize_path(path.trim_start_matches("/public"))
+    } else {
+        normalize_path(path)
     }
-    anyhow::bail!("无法生成公开文件名")
 }
 
 fn clean_file_name(file_name: &str) -> String {
@@ -2490,6 +2439,7 @@ function showUploadProgress(files) {
     lastAt: performance.now(),
     lastLoaded: 0,
     speed: 0,
+    saveTimer: null,
   };
   $('upload-progress').classList.remove('hidden');
   $('upload-progress-title').textContent = `正在上传 ${files.length} 个文件`;
@@ -2505,12 +2455,18 @@ function updateUploadProgress(event, files) {
     return;
   }
   const percent = Math.min(100, Math.round((loaded / total) * 100));
-  $('upload-progress-detail').textContent = `${percent}% · ${formatSize(loaded)} / ${formatSize(total)} · ${formatUploadSpeed(loaded)}`;
+  if (percent >= 100) {
+    showUploadSaving(loaded, total);
+  } else {
+    $('upload-progress-title').textContent = `正在上传 ${files.length} 个文件`;
+    $('upload-progress-detail').textContent = `${percent}% · ${formatSize(loaded)} / ${formatSize(total)} · ${formatUploadSpeed(loaded)}`;
+  }
   $('upload-progress-bar').style.width = `${percent}%`;
 }
 
 function hideUploadProgress() {
   $('upload-progress').classList.add('hidden');
+  if (state.upload?.saveTimer) clearTimeout(state.upload.saveTimer);
   state.upload = null;
 }
 
@@ -2533,6 +2489,16 @@ function formatUploadSpeed(loaded) {
   const averageSpeed = (loaded * 1000) / elapsed;
   const speed = upload.speed || averageSpeed;
   return `${formatSize(speed)}/s`;
+}
+
+function showUploadSaving(loaded, total) {
+  $('upload-progress-title').textContent = '服务器保存中';
+  $('upload-progress-detail').textContent = `100% · ${formatSize(loaded)} / ${formatSize(total)} · 等待服务器确认`;
+  if (state.upload && !state.upload.saveTimer) {
+    state.upload.saveTimer = setTimeout(() => {
+      $('upload-progress-detail').textContent = `100% · ${formatSize(loaded)} / ${formatSize(total)} · 仍在等待服务器保存，请稍候`;
+    }, 15000);
+  }
 }
 
 async function createFolder() {
@@ -2721,5 +2687,17 @@ mod tests {
         assert_eq!(parse_upload_limit("1024").unwrap(), 1024);
         assert!(parse_upload_limit("0").is_err());
         assert!(parse_upload_limit("not-a-number").is_err());
+    }
+
+    #[test]
+    fn public_url_maps_back_to_source_path() {
+        assert_eq!(
+            public_url_for_source_path("/docs/report.pdf"),
+            "/public/docs/report.pdf"
+        );
+        assert_eq!(
+            source_path_from_public_url("/public/docs/report.pdf"),
+            "/docs/report.pdf"
+        );
     }
 }
