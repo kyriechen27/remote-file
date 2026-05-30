@@ -6,6 +6,8 @@ const state = {
   upload: null,
 };
 
+const LARGE_UPLOAD_THRESHOLD = 64 * 1024 * 1024;
+
 const $ = (id) => document.getElementById(id);
 
 async function api(url, options = {}) {
@@ -328,17 +330,20 @@ async function uploadFiles(files) {
       ? 'overwrite'
       : 'rename';
   }
-  const data = new FormData();
-  fileList.forEach((file) => data.append('file', file));
   showUploadProgress(fileList);
   $('upload-btn').disabled = true;
+  let uploadedBytes = 0;
+  const totalBytes = totalUploadSize(fileList);
   try {
-    await uploadWithProgress(
-      `/api/files${encodeApiPath(state.path)}?conflict=${conflict}`,
-      data,
-      (event) => updateUploadProgress(event, fileList)
-    );
-    updateUploadProgress({ lengthComputable: true, loaded: totalUploadSize(fileList), total: totalUploadSize(fileList) }, fileList);
+    for (const file of fileList) {
+      if (file.size > LARGE_UPLOAD_THRESHOLD) {
+        await uploadLargeFile(file, conflict, uploadedBytes, totalBytes, fileList);
+      } else {
+        await uploadSingleFile(file, conflict, uploadedBytes, totalBytes, fileList);
+      }
+      uploadedBytes += file.size;
+      updateUploadProgress({ lengthComputable: true, loaded: uploadedBytes, total: totalBytes }, fileList);
+    }
     toast('上传完成');
     await loadFiles();
   } finally {
@@ -346,6 +351,94 @@ async function uploadFiles(files) {
     $('upload-input').value = '';
     setTimeout(hideUploadProgress, 500);
   }
+}
+
+async function uploadSingleFile(file, conflict, uploadedBytes, totalBytes, files) {
+  const data = new FormData();
+  data.append('file', file);
+  await uploadWithProgress(
+    `/api/files${encodeApiPath(state.path)}?conflict=${conflict}`,
+    data,
+    (event) => {
+      const loaded = event.lengthComputable ? uploadedBytes + event.loaded : uploadedBytes;
+      updateUploadProgress({ lengthComputable: true, loaded, total: totalBytes }, files);
+    }
+  );
+}
+
+async function uploadLargeFile(file, conflict, uploadedBytes, totalBytes, files) {
+  const started = await api('/api/uploads/start', {
+    method: 'POST',
+    body: JSON.stringify({
+      path: state.path,
+      file_name: file.name,
+      conflict,
+      content_type: file.type || 'application/octet-stream',
+      size: file.size,
+    }),
+  });
+  const partSize = started.part_size || (32 * 1024 * 1024);
+  const parts = [];
+  let offset = 0;
+  let partNumber = 1;
+  try {
+    while (offset < file.size) {
+      const end = Math.min(offset + partSize, file.size);
+      const chunk = file.slice(offset, end);
+      const part = await uploadPartWithProgress(started, partNumber, chunk, (event) => {
+        const chunkLoaded = event.lengthComputable ? event.loaded : chunk.size;
+        updateUploadProgress({
+          lengthComputable: true,
+          loaded: uploadedBytes + offset + chunkLoaded,
+          total: totalBytes,
+        }, files);
+      });
+      parts.push(part);
+      offset = end;
+      partNumber += 1;
+    }
+    await api('/api/uploads/complete', {
+      method: 'POST',
+      body: JSON.stringify({
+        path: started.path,
+        upload_id: started.upload_id,
+        parts,
+      }),
+    });
+  } catch (err) {
+    await api(`/api/uploads/abort?path=${encodeURIComponent(started.path)}&upload_id=${encodeURIComponent(started.upload_id)}`, {
+      method: 'DELETE',
+    }).catch(() => {});
+    throw err;
+  }
+}
+
+function uploadPartWithProgress(upload, partNumber, chunk, onProgress) {
+  const query = new URLSearchParams({
+    path: upload.path,
+    upload_id: upload.upload_id,
+    part_number: String(partNumber),
+  });
+  return new Promise((resolve, reject) => {
+    const request = new XMLHttpRequest();
+    request.open('PUT', `/api/uploads/part?${query}`);
+    request.withCredentials = true;
+    request.upload.onprogress = onProgress;
+    request.onload = () => {
+      if (request.status >= 200 && request.status < 300) {
+        try {
+          resolve(JSON.parse(request.responseText));
+        } catch {
+          reject(new Error('上传分片响应格式错误'));
+        }
+        return;
+      }
+      reject(new Error(uploadErrorMessage(request)));
+    };
+    request.onerror = () => reject(new Error('上传分片失败，请检查网络后重试'));
+    request.onabort = () => reject(new Error('上传已取消'));
+    request.send(chunk);
+  });
 }
 
 function uploadWithProgress(url, data, onProgress) {

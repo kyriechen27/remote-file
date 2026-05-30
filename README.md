@@ -131,6 +131,8 @@ docker compose up -d
 
 Cloudflare 版本和 Rust/Docker 版本共用前端交互和 API 路径，但存储后端不同：Cloudflare 版本没有本地文件系统，全部数据都会写入 R2。
 
+Cloudflare Pages Functions 单次请求体有平台上限。Cloudflare 版本会对超过 64MB 的文件自动使用 R2 multipart upload 分片上传，避免大文件直接上传时出现 `413 Payload Too Large`。
+
 ### 通过 Cloudflare 控制台部署
 
 1. Fork 或推送本仓库到 GitHub。

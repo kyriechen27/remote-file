@@ -2,6 +2,7 @@ const DEFAULT_ADMIN = 'admin';
 const DEFAULT_PASSWORD = 'admin';
 const STATE_KEY = '__remote_file_meta/state.json';
 const AUDIT_KEY = '__remote_file_meta/audit.json';
+const MULTIPART_PART_SIZE = 32 * 1024 * 1024;
 
 export async function onRequest(context) {
   const app = new RemoteFileApp(context);
@@ -30,6 +31,10 @@ class RemoteFileApp {
       if (method === 'GET' && pathname === '/api/session') return this.apiSession();
       if (method === 'POST' && pathname === '/api/login') return this.apiLogin();
       if (method === 'POST' && pathname === '/api/logout') return this.apiLogout();
+      if (pathname === '/api/uploads/start' && method === 'POST') return this.apiMultipartStart();
+      if (pathname === '/api/uploads/part' && method === 'PUT') return this.apiMultipartPart();
+      if (pathname === '/api/uploads/complete' && method === 'POST') return this.apiMultipartComplete();
+      if (pathname === '/api/uploads/abort' && method === 'DELETE') return this.apiMultipartAbort();
       if (pathname === '/api/files') {
         if (method === 'GET') return this.apiFiles('/');
         if (method === 'PUT') return this.apiUpload('/');
@@ -177,6 +182,77 @@ class RemoteFileApp {
       uploaded += 1;
     }
     await this.recordAudit(store, user.username, 'upload', dirPath, 204, `上传 ${uploaded} 个文件`);
+    return new Response(null, { status: 204 });
+  }
+
+  async apiMultipartStart() {
+    const store = await this.loadStore();
+    const payload = await readJson(this.request);
+    const dirPath = normalizePath(payload.path || '/');
+    const result = await this.requireUploadAccess(store, dirPath);
+    if (result.response) return result.response;
+    const cleanName = cleanFileName(payload.file_name || 'upload.bin');
+    const conflict = payload.conflict || 'error';
+    const targetPath = await this.uploadTargetPath(dirPath, cleanName, conflict);
+    if (targetPath.response) return targetPath.response;
+    const upload = await this.bucket.createMultipartUpload(fileKey(targetPath.path), {
+      httpMetadata: { contentType: payload.content_type || contentTypeForPath(targetPath.path) },
+      customMetadata: {
+        remoteFilePath: targetPath.path,
+        uploadedBy: result.user.username,
+        originalName: cleanName,
+      },
+    });
+    return json({
+      path: targetPath.path,
+      upload_id: upload.uploadId,
+      part_size: MULTIPART_PART_SIZE,
+    });
+  }
+
+  async apiMultipartPart() {
+    const store = await this.loadStore();
+    const path = normalizePath(this.url.searchParams.get('path') || '/');
+    const uploadId = this.url.searchParams.get('upload_id') || '';
+    const partNumber = Number(this.url.searchParams.get('part_number') || '0');
+    const result = await this.requireUploadAccess(store, parentPath(path));
+    if (result.response) return result.response;
+    if (!uploadId || !Number.isInteger(partNumber) || partNumber < 1 || partNumber > 10000) {
+      return jsonError(400, '分片参数不合法');
+    }
+    const upload = this.bucket.resumeMultipartUpload(fileKey(path), uploadId);
+    const part = await upload.uploadPart(partNumber, this.request.body);
+    return json(part);
+  }
+
+  async apiMultipartComplete() {
+    const store = await this.loadStore();
+    const payload = await readJson(this.request);
+    const path = normalizePath(payload.path || '/');
+    const uploadId = String(payload.upload_id || '');
+    const parts = Array.isArray(payload.parts) ? payload.parts : [];
+    const result = await this.requireUploadAccess(store, parentPath(path));
+    if (result.response) return result.response;
+    if (!uploadId || !parts.length) return jsonError(400, '缺少上传分片');
+    const upload = this.bucket.resumeMultipartUpload(fileKey(path), uploadId);
+    const completed = await upload.complete(parts.map((part) => ({
+      partNumber: Number(part.partNumber),
+      etag: String(part.etag),
+    })));
+    await this.putDirectoryMarker(parentPath(path));
+    await this.recordAudit(store, result.user.username, 'upload', parentPath(path), 204, `分片上传 ${path}`);
+    return json({ path, etag: completed?.etag || null });
+  }
+
+  async apiMultipartAbort() {
+    const store = await this.loadStore();
+    const path = normalizePath(this.url.searchParams.get('path') || '/');
+    const uploadId = this.url.searchParams.get('upload_id') || '';
+    const result = await this.requireUploadAccess(store, parentPath(path));
+    if (result.response) return result.response;
+    if (!uploadId) return jsonError(400, '缺少 upload_id');
+    const upload = this.bucket.resumeMultipartUpload(fileKey(path), uploadId);
+    await upload.abort();
     return new Response(null, { status: 204 });
   }
 
@@ -365,6 +441,14 @@ class RemoteFileApp {
     if (!user) return { response: jsonError(401, '请先登录') };
     if (user.role !== 'admin') return { response: jsonError(403, '只有管理员可以访问后台') };
     return { store, user };
+  }
+
+  async requireUploadAccess(store, dirPath) {
+    const user = await this.currentUserOrBasic(store);
+    if (!user) return { response: jsonError(401, '请先登录') };
+    if (!user.permissions.can_upload) return { response: jsonError(403, '没有上传权限') };
+    if (!canRead(user, dirPath)) return { response: jsonError(403, '不能上传到这个目录') };
+    return { user };
   }
 
   async listEntries(store, user, path) {
