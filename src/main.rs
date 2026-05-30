@@ -941,7 +941,6 @@ async fn api_delete(
     }
     let mut store = state.store.write().await;
     if let Some(public_path) = public_path_for_source(&store, &path) {
-        store.public_files.remove(&public_path);
         store.download_counts.remove(&public_path);
     }
     store.public_files.remove(&path);
@@ -1186,6 +1185,12 @@ async fn api_publish(
     }
     let mut store = state.store.write().await;
     store.public_copies.remove(&path);
+    let public_path = public_visible_path_for_source(&path);
+    if let Some(conflict_source) = public_source_path(&store, &public_path)
+        && conflict_source != path
+    {
+        return error(StatusCode::CONFLICT, "公开链接路径已被其他文件占用");
+    }
     store.public_files.insert(
         path.clone(),
         PublicFile {
@@ -1208,7 +1213,7 @@ async fn api_publish(
     )
     .await;
     Json(serde_json::json!({
-        "public_path": path,
+        "public_path": public_path,
         "public_url": public_url_for_source_path(&path)
     }))
     .into_response()
@@ -1224,10 +1229,10 @@ async fn api_unpublish(
     };
     let path = normalize_path(&path);
     let mut store = state.store.write().await;
-    let public_path = path.clone();
+    let public_path = public_path_for_source(&store, &path).unwrap_or_else(|| path.clone());
     store.public_copies.remove(&path);
     store.public_files.remove(&path);
-    store.download_counts.remove(&path);
+    store.download_counts.remove(&public_path);
     if let Err(err) = store.save().await {
         return error(StatusCode::INTERNAL_SERVER_ERROR, &err.to_string());
     }
@@ -1520,7 +1525,7 @@ fn public_path_for_source(store: &Store, source_path: &str) -> Option<String> {
     store
         .public_files
         .contains_key(source_path)
-        .then(|| source_path.to_string())
+        .then(|| public_visible_path_for_source(source_path))
 }
 
 fn public_source_path(store: &Store, public_path: &str) -> Option<String> {
@@ -1530,7 +1535,13 @@ fn public_source_path(store: &Store, public_path: &str) -> Option<String> {
     } else if store.public_files.contains_key(public_path) {
         Some(public_path.to_string())
     } else {
-        None
+        store
+            .public_files
+            .keys()
+            .find(|published_source| {
+                public_visible_path_for_source(published_source) == source_path
+            })
+            .cloned()
     }
 }
 
@@ -1591,7 +1602,10 @@ fn normalize_public_request_path(path: &str) -> String {
 }
 
 fn public_url_for_source_path(path: &str) -> String {
-    format!("/public{}", encode_path(path).trim_start_matches("/public"))
+    format!(
+        "/public{}",
+        encode_path(&public_visible_path_for_source(path))
+    )
 }
 
 fn source_path_from_public_url(path: &str) -> String {
@@ -1599,6 +1613,19 @@ fn source_path_from_public_url(path: &str) -> String {
         normalize_path(path.trim_start_matches("/public"))
     } else {
         normalize_path(path)
+    }
+}
+
+fn public_visible_path_for_source(path: &str) -> String {
+    let path = normalize_path(path);
+    let parts = path
+        .split('/')
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>();
+    if parts.len() >= 3 && parts[0] == "user" {
+        format!("/{}", parts[2..].join("/"))
+    } else {
+        path
     }
 }
 
@@ -2698,6 +2725,14 @@ mod tests {
         assert_eq!(
             source_path_from_public_url("/public/docs/report.pdf"),
             "/docs/report.pdf"
+        );
+        assert_eq!(
+            public_url_for_source_path("/user/kyriechen/tools/gcc/riscv/toolchain.tar.gz"),
+            "/public/tools/gcc/riscv/toolchain.tar.gz"
+        );
+        assert_eq!(
+            public_visible_path_for_source("/user/kyriechen/tools/gcc/riscv/toolchain.tar.gz"),
+            "/tools/gcc/riscv/toolchain.tar.gz"
         );
     }
 }

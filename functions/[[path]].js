@@ -291,7 +291,6 @@ class RemoteFileApp {
     if (!deleted) return jsonError(404, '文件不存在');
     const publicPath = publicPathForSource(store, normalized);
     if (publicPath) {
-      delete store.public_files[publicPath];
       delete store.download_counts[publicPath];
     }
     delete store.public_files[normalized];
@@ -388,10 +387,13 @@ class RemoteFileApp {
     if (!head) return jsonError(404, '文件不存在');
     if (head.customMetadata && head.customMetadata.directory === 'true') return jsonError(400, '暂不支持公开整个目录');
     delete store.public_copies[normalized];
+    const publicPath = publicVisiblePathForSource(normalized);
+    const conflictSource = publicSourcePath(store, publicPath);
+    if (conflictSource && conflictSource !== normalized) return jsonError(409, '公开链接路径已被其他文件占用');
     store.public_files[normalized] = { path: normalized, published_by: user.username, published_at: nowIso() };
     await this.saveStore(store);
     await this.recordAudit(store, user.username, 'publish', normalized, 200, '公开文件链接');
-    return json({ public_path: normalized, public_url: publicUrlForSourcePath(normalized) });
+    return json({ public_path: publicPath, public_url: publicUrlForSourcePath(normalized) });
   }
 
   async apiUnpublish(path) {
@@ -401,7 +403,7 @@ class RemoteFileApp {
     if (!user) return jsonError(401, '请先登录');
     const publicPath = publicPathForSource(store, normalized) || normalized;
     delete store.public_copies[normalized];
-    delete store.public_files[publicPath];
+    delete store.public_files[normalized];
     delete store.download_counts[publicPath];
     await this.saveStore(store);
     await this.recordAudit(store, user.username, 'unpublish', normalized, 200, `取消公开链接 ${publicPath}`);
@@ -708,13 +710,16 @@ function isPublicPath(path) {
 }
 
 function publicPathForSource(store, sourcePath) {
-  return store.public_files[sourcePath] ? sourcePath : null;
+  return store.public_files[sourcePath] ? publicVisiblePathForSource(sourcePath) : null;
 }
 
 function publicSourcePath(store, publicPath) {
   const source = sourcePathFromPublicUrl(publicPath);
   if (store.public_files[source]) return source;
   if (store.public_files[publicPath]) return publicPath;
+  for (const sourcePath of Object.keys(store.public_files)) {
+    if (publicVisiblePathForSource(sourcePath) === source) return sourcePath;
+  }
   return null;
 }
 
@@ -755,12 +760,18 @@ function normalizePublicRequestPath(path) {
 }
 
 function publicUrlForSourcePath(path) {
-  return `/public${encodePath(path).replace(/^\/public/, '')}`;
+  return `/public${encodePath(publicVisiblePathForSource(path))}`;
 }
 
 function sourcePathFromPublicUrl(path) {
   const normalized = normalizePath(path);
   return isPublicPath(normalized) ? normalizePath(normalized.slice('/public'.length)) : normalized;
+}
+
+function publicVisiblePathForSource(path) {
+  const normalized = normalizePath(path);
+  const parts = normalized.split('/').filter(Boolean);
+  return parts.length >= 3 && parts[0] === 'user' ? `/${parts.slice(2).join('/')}` : normalized;
 }
 
 function fileKey(path) {

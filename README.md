@@ -202,6 +202,8 @@ npm run deploy:cloudflare
 http://127.0.0.1:8080/public/path/to/file.ext
 ```
 
+如果源文件位于普通用户目录，例如 `/user/kyriechen/tools/file.ext`，公开直链会隐藏用户目录前缀，生成为 `/public/tools/file.ext`。
+
 该链接不需要登录即可访问。取消公开后，直链失效，原文件仍保留在原目录。
 
 ## 登录链接和文件授权
