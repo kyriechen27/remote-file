@@ -2,7 +2,6 @@ const DEFAULT_ADMIN = 'admin';
 const DEFAULT_PASSWORD = 'admin';
 const STATE_KEY = '__remote_file_meta/state.json';
 const AUDIT_KEY = '__remote_file_meta/audit.json';
-const EMPTY_SHA256 = 'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855';
 
 export async function onRequest(context) {
   const app = new RemoteFileApp(context);
@@ -19,12 +18,15 @@ class RemoteFileApp {
   }
 
   async handle() {
-    if (!this.bucket) {
-      return jsonError(500, 'Cloudflare R2 binding BUCKET is not configured');
-    }
     try {
       const method = this.request.method.toUpperCase();
       const pathname = this.url.pathname;
+      if (!isFunctionRoute(pathname)) {
+        return this.context.next();
+      }
+      if (!this.bucket) {
+        return jsonError(500, 'Cloudflare R2 binding BUCKET is not configured');
+      }
       if (method === 'GET' && pathname === '/api/session') return this.apiSession();
       if (method === 'POST' && pathname === '/api/login') return this.apiLogin();
       if (method === 'POST' && pathname === '/api/logout') return this.apiLogout();
@@ -538,6 +540,10 @@ function normalizeStore(store) {
     download_counts: store.download_counts || {},
     fresh_setup: store.fresh_setup !== false,
   };
+}
+
+function isFunctionRoute(pathname) {
+  return pathname.startsWith('/api/') || pathname === '/api' || pathname.startsWith('/public/') || pathname.startsWith('/p/');
 }
 
 function fileEntry(store, entry) {
