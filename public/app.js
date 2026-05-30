@@ -6,7 +6,7 @@ const state = {
   upload: null,
 };
 
-const LARGE_UPLOAD_THRESHOLD = 64 * 1024 * 1024;
+const LARGE_UPLOAD_THRESHOLD = 8 * 1024 * 1024;
 
 const $ = (id) => document.getElementById(id);
 

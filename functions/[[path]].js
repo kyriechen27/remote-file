@@ -2,7 +2,7 @@ const DEFAULT_ADMIN = 'admin';
 const DEFAULT_PASSWORD = 'admin';
 const STATE_KEY = '__remote_file_meta/state.json';
 const AUDIT_KEY = '__remote_file_meta/audit.json';
-const MULTIPART_PART_SIZE = 32 * 1024 * 1024;
+const MULTIPART_PART_SIZE = 8 * 1024 * 1024;
 
 export async function onRequest(context) {
   const app = new RemoteFileApp(context);
